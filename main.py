@@ -46,49 +46,65 @@ def get_today_url() -> str:
 
 
 def scrape_evandjelje(url: str) -> dict:
-    """Scrapa stranicu i vraća dict s naslovom i tekstom evanđelja."""
+    """
+    Scrapa stranicu i vraća dict s naslovom i tekstom evanđelja.
+
+    Struktura na hilp.hr izgleda ovako:
+        <h4>Evanđelje:</h4>
+        <h4>Mt 20,17-28</h4>           ← referenca
+        <h4>Osudit će ga na smrt.</h4>  ← naslov
+        <p>Čitanje svetog Evanđelja po Mateju</p>
+        <p>U ono vrijeme: ...</p>
+        ...
+        <p>Riječ Gospodnja.</p>
+        <h4>Sljedeća sekcija</h4>       ← kraj
+    """
     print(f"Scraping: {url}")
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Pronađi sekciju evanđelja
     evandjelje_data = {"naslov": "", "referenca": "", "tekst": ""}
 
-    headings = soup.find_all(["h4", "h3", "h2"])
+    # 1. Pronađi h4 koji sadrži "Evanđelje:"
     evandjelje_heading = None
-    for h in headings:
-        if "Evanđelje" in h.get_text():
+    for h in soup.find_all(["h4", "h3", "h2"]):
+        if re.search(r"Evanđelje", h.get_text()):
             evandjelje_heading = h
             break
 
     if not evandjelje_heading:
         raise ValueError("Nije pronađeno evanđelje na stranici!")
 
-    # Referenca (npr. Mt 20,17-28) — odmah iza headinga
-    ref_tag = evandjelje_heading.find_next_sibling()
-    if ref_tag:
-        evandjelje_data["referenca"] = ref_tag.get_text(strip=True)
+    # 2. Sljedeći h4 = referenca (npr. "Mt 20,17-28")
+    node = evandjelje_heading.find_next_sibling()
+    if node and node.name in ["h4", "h3", "h2"]:
+        evandjelje_data["referenca"] = node.get_text(strip=True)
+        node = node.find_next_sibling()
 
-    # Naslov evanđelja (sljedeći heading)
-    naslov_tag = ref_tag.find_next_sibling() if ref_tag else None
-    if naslov_tag:
-        evandjelje_data["naslov"] = naslov_tag.get_text(strip=True)
+    # 3. Sljedeći h4 = naslov (npr. "Osudit će ga na smrt.")
+    if node and node.name in ["h4", "h3", "h2"]:
+        evandjelje_data["naslov"] = node.get_text(strip=True)
+        node = node.find_next_sibling()
 
-    # Tekst evanđelja — skupi sve <p> tagove do sljedećeg heading-a
+    # 4. Sve do sljedećeg h4/h3/h2 = tekst evanđelja
+    #    (uključujući <p> i sve inline elemente)
     tekst_dijelovi = []
-    node = naslov_tag.find_next_sibling() if naslov_tag else evandjelje_heading.find_next_sibling()
     while node:
         if node.name in ["h4", "h3", "h2"]:
-            break
-        text = node.get_text(strip=True)
+            break  # kraj sekcije evanđelja
+        text = node.get_text(separator=" ", strip=True)
         if text:
             tekst_dijelovi.append(text)
         node = node.find_next_sibling()
 
-    evandjelje_data["tekst"] = "\n".join(tekst_dijelovi)
+    evandjelje_data["tekst"] = " ".join(tekst_dijelovi)
 
-    print(f"Pronađeno evanđelje: {evandjelje_data['referenca']} - {evandjelje_data['naslov']}")
+    if not evandjelje_data["tekst"]:
+        raise ValueError("Tekst evanđelja je prazan — provjeri HTML strukturu!")
+
+    print(f"Pronađeno evanđelje: {evandjelje_data['referenca']} — {evandjelje_data['naslov']}")
+    print(f"Duljina teksta: {len(evandjelje_data['tekst'])} znakova")
     return evandjelje_data
 
 
