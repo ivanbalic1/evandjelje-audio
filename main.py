@@ -5,7 +5,6 @@ generira 10-minutni audio (ElevenLabs) i šalje mailom.
 """
 
 import os
-import re
 import time
 import smtplib
 import tempfile
@@ -15,11 +14,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
 from pydub import AudioSegment
 
 
-# ── Konfiguracija (čita iz environment varijabli) ──────────────────────────────
+# ── Konfiguracija ──────────────────────────────────────────────────────────────
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")
 
@@ -38,17 +37,11 @@ def get_today_url() -> str:
         3: "cetvrtak", 4: "petak", 5: "subota", 6: "nedjelja"
     }
     today = datetime.date.today()
-    day_name = days_hr[today.weekday()]
-    return f"https://hilp.hr/liturgija-dana/{day_name}-{today.day}-{today.month}-{today.year}/"
+    return f"https://hilp.hr/liturgija-dana/{days_hr[today.weekday()]}-{today.day}-{today.month}-{today.year}/"
 
 
-def scrape_evandjelje(url: str) -> dict:
-    """
-    Izvlači evanđelje koristeći et_pb_blurb divove (isti pristup kao Kindle skripta).
-    Tekst ide od 'Čitanje svetog Evanđelja' do 'Riječ Gospodnja.'
-    """
-    print(f"Scraping: {url}")
-
+def dohvati_stranicu(url: str):
+    """Dohvaća stranicu s browser User-Agentom."""
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -59,28 +52,31 @@ def scrape_evandjelje(url: str) -> dict:
     session.get("https://hilp.hr/", headers=headers, timeout=15)
     r = session.get(url, headers=headers, timeout=15)
     r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
-    soup = BeautifulSoup(r.text, "html.parser")
 
-    # Isti pristup kao Kindle skripta — et_pb_blurb divovi
-    blurbovi = soup.find_all(
-        "div",
-        class_=lambda c: c and "et_pb_blurb" in " ".join(c) and "tb_footer" not in " ".join(c)
-    )
-    print(f"Pronađeno blurbova: {len(blurbovi)}")
+def scrape_evandjelje(url: str) -> dict:
+    """
+    Izvlači evanđelje iz et_pb_blurb_description divova.
+    Tekst: od 'Čitanje svetog Evanđelja' do 'Riječ Gospodnja.'
+    """
+    print(f"Scraping: {url}")
+    soup = dohvati_stranicu(url)
 
     evandjelje_data = {"naslov": "", "referenca": "", "tekst": ""}
 
-    for blurb in blurbovi:
-        tekst_blurba = blurb.get_text(separator="\n", strip=True)
+    # Pronađi sve et_pb_blurb_description divove — tu živi sav sadržaj
+    opisi = soup.find_all("div", class_="et_pb_blurb_description")
+    print(f"Pronađeno blurb_description divova: {len(opisi)}")
 
-        if "Evanđelje" not in tekst_blurba:
-            continue
-        if "Čitanje svetog Evanđelja" not in tekst_blurba:
+    for opis in opisi:
+        tekst = opis.get_text(separator="\n", strip=True)
+
+        if "Čitanje svetog Evanđelja" not in tekst:
             continue
 
-        # Izvuci referencu i naslov iz h4 tagova unutar blurba
-        h4_tagovi = blurb.find_all(["h4", "h3", "h2"])
+        # Izvuci referencu i naslov iz h4 tagova
+        h4_tagovi = opis.find_all(["h4", "h3", "h2"])
         for i, h in enumerate(h4_tagovi):
             if "Evanđelje" in h.get_text() and "Čitanje" not in h.get_text():
                 if i + 1 < len(h4_tagovi):
@@ -92,7 +88,7 @@ def scrape_evandjelje(url: str) -> dict:
         # Skupi tekst od "Čitanje svetog Evanđelja" do "Riječ Gospodnja."
         redci = []
         unutar = False
-        for p in blurb.find_all("p"):
+        for p in opis.find_all("p"):
             tekst_p = p.get_text(separator=" ", strip=True)
             if "Čitanje svetog Evanđelja" in tekst_p:
                 unutar = True
@@ -107,9 +103,9 @@ def scrape_evandjelje(url: str) -> dict:
             break
 
     if not evandjelje_data["tekst"]:
-        raise ValueError("Tekst evanđelja nije pronađen! Provjeri strukturu stranice.")
+        raise ValueError("Tekst evanđelja nije pronađen!")
 
-    print(f"Pronađeno evanđelje: {evandjelje_data['referenca']} — {evandjelje_data['naslov']}")
+    print(f"Pronađeno: {evandjelje_data['referenca']} — {evandjelje_data['naslov']}")
     print(f"Duljina teksta: {len(evandjelje_data['tekst'])} znakova")
     return evandjelje_data
 
@@ -153,19 +149,18 @@ def generate_tts(text: str, output_path: str) -> None:
 
 def build_final_audio(reading_paths: list, target_ms: int) -> AudioSegment:
     """
-    Spaja 3 čitanja s tišinom između, ukupno točno target_ms.
     Raspored: [tišina] čitanje1 [tišina] čitanje2 [tišina] čitanje3 [tišina]
+    4 jednaka bloka tišine.
     """
     segments = [AudioSegment.from_mp3(p) for p in reading_paths]
     total_reading_ms = sum(len(s) for s in segments)
     remaining_ms = target_ms - total_reading_ms
 
     if remaining_ms < 0:
-        print("UPOZORENJE: Čitanja su duža od 10 min, nema tišine.")
+        print("UPOZORENJE: Čitanja su dulja od 10 min!")
         silence_ms = 1000
     else:
-        # 4 bloka tišine: prije, između (×2), poslije
-        silence_ms = remaining_ms // 4
+        silence_ms = remaining_ms // 4  # 4 bloka tišine
 
     print(f"Trajanje čitanja: {total_reading_ms/1000:.1f}s")
     print(f"Tišina po bloku: {silence_ms/1000:.1f}s")
@@ -191,18 +186,14 @@ def send_email(mp3_path: str, evandjelje: dict, recipient: str) -> None:
     today = datetime.date.today()
     subject = f"Evanđelje dana — {today.strftime('%d. %m. %Y.')} — {evandjelje['referenca']}"
 
-    body = f"""Dobro jutro,
-
-U prilogu je audio evanđelje za danas.
-
-📖 {evandjelje['referenca']}
-✝ {evandjelje['naslov']}
-
-Čitanje je ponovljeno 3 puta unutar 10 minuta.
-
-Lp,
-Vaš automatski podsjetnik
-"""
+    body = (
+        f"Dobro jutro,\n\n"
+        f"U prilogu je audio evanđelje za danas.\n\n"
+        f"📖 {evandjelje['referenca']}\n"
+        f"✝ {evandjelje['naslov']}\n\n"
+        f"Čitanje je ponovljeno 3 puta unutar 10 minuta.\n\n"
+        f"Lp,\nVaš automatski podsjetnik"
+    )
 
     msg = MIMEMultipart()
     msg["From"] = GMAIL_USER
