@@ -186,8 +186,28 @@ def upload_to_github_release(mp3_path: str, filename: str, evandjelje: dict) -> 
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # 1. Kreiraj release
+    # 1. Provjeri postoji li već release s tim tagom, obriši ga ako da
     print(f"Kreiram GitHub Release: {tag}")
+    existing = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO_AUDIO}/releases/tags/{tag}",
+        headers=headers,
+        timeout=15,
+    )
+    if existing.status_code == 200:
+        old_id = existing.json()["id"]
+        print(f"Release već postoji (id={old_id}), brišem...")
+        requests.delete(
+            f"https://api.github.com/repos/{GITHUB_REPO_AUDIO}/releases/{old_id}",
+            headers=headers,
+            timeout=15,
+        )
+        # Obriši i tag
+        requests.delete(
+            f"https://api.github.com/repos/{GITHUB_REPO_AUDIO}/git/refs/tags/{tag}",
+            headers=headers,
+            timeout=15,
+        )
+
     r = requests.post(
         f"https://api.github.com/repos/{GITHUB_REPO_AUDIO}/releases",
         headers=headers,
