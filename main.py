@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 Evanđelje Audio - Svaki dan scrapa evanđelje s hilp.hr,
-generira 10-minutni audio (ElevenLabs) i šalje mailom.
+generira 10-minutni audio (ElevenLabs), šalje mailom i objavljuje na podcast RSS feed.
 """
 
 import os
+import re
 import time
+import json
 import smtplib
 import tempfile
 import datetime
 import requests
+import subprocess
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -26,6 +29,10 @@ GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ivan-os@live.com")
 
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = "ivanbalic1/evandjelje-audio"
+GITHUB_PAGES_BASE = "https://ivanbalic1.github.io/evandjelje-audio"
+
 TARGET_DURATION_MS = 10 * 60 * 1000  # 10 minuta
 
 
@@ -41,7 +48,6 @@ def get_today_url() -> str:
 
 
 def dohvati_stranicu(url: str):
-    """Dohvaća stranicu s browser User-Agentom."""
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -56,26 +62,19 @@ def dohvati_stranicu(url: str):
 
 
 def scrape_evandjelje(url: str) -> dict:
-    """
-    Izvlači evanđelje iz et_pb_blurb_description divova.
-    Tekst: od 'Čitanje svetog Evanđelja' do 'Riječ Gospodnja.'
-    """
     print(f"Scraping: {url}")
     soup = dohvati_stranicu(url)
 
     evandjelje_data = {"naslov": "", "referenca": "", "tekst": ""}
 
-    # Pronađi sve et_pb_blurb_description divove — tu živi sav sadržaj
     opisi = soup.find_all("div", class_="et_pb_blurb_description")
     print(f"Pronađeno blurb_description divova: {len(opisi)}")
 
     for opis in opisi:
         tekst = opis.get_text(separator="\n", strip=True)
-
         if "Čitanje svetog Evanđelja" not in tekst:
             continue
 
-        # Izvuci referencu i naslov iz h4 tagova
         h4_tagovi = opis.find_all(["h4", "h3", "h2"])
         for i, h in enumerate(h4_tagovi):
             if "Evanđelje" in h.get_text() and "Čitanje" not in h.get_text():
@@ -85,7 +84,6 @@ def scrape_evandjelje(url: str) -> dict:
                     evandjelje_data["naslov"] = h4_tagovi[i + 2].get_text(strip=True)
                 break
 
-        # Skupi tekst od "Čitanje svetog Evanđelja" do "Riječ Gospodnja."
         redci = []
         unutar = False
         for p in opis.find_all("p"):
@@ -98,7 +96,6 @@ def scrape_evandjelje(url: str) -> dict:
                 break
 
         evandjelje_data["tekst"] = " ".join(redci)
-
         if evandjelje_data["tekst"]:
             break
 
@@ -136,7 +133,6 @@ def generate_tts(text: str, output_path: str) -> None:
     }
     resp = requests.post(url, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-
     with open(output_path, "wb") as f:
         f.write(resp.content)
     print(f"TTS spremljen: {output_path}")
@@ -151,15 +147,10 @@ def build_final_audio(reading_path: str, target_ms: int) -> AudioSegment:
     """
     segment = AudioSegment.from_mp3(reading_path)
     reading_ms = len(segment)
-    intro_ms = 5000  # 5 sekundi na početku
+    intro_ms = 5000
     remaining_ms = target_ms - intro_ms - (reading_ms * 3)
 
-    if remaining_ms < 0:
-        print("UPOZORENJE: Čitanja su dulja od 10 min!")
-        silence_ms = 1000
-    else:
-        # 3 bloka tišine: između čitanja (×2) + na kraju (×1)
-        silence_ms = remaining_ms // 3
+    silence_ms = max(1000, remaining_ms // 3) if remaining_ms > 0 else 1000
 
     print(f"Trajanje jednog čitanja: {reading_ms/1000:.1f}s")
     print(f"Tišina po bloku: {silence_ms/1000:.1f}s")
@@ -169,7 +160,6 @@ def build_final_audio(reading_path: str, target_ms: int) -> AudioSegment:
         final += segment
         final += AudioSegment.silent(duration=silence_ms)
 
-    # Fino podešavanje na točno 10 min
     if len(final) < target_ms:
         final += AudioSegment.silent(duration=target_ms - len(final))
     else:
@@ -179,9 +169,144 @@ def build_final_audio(reading_path: str, target_ms: int) -> AudioSegment:
     return final
 
 
+# ── GitHub Release upload ──────────────────────────────────────────────────────
+
+def upload_to_github_release(mp3_path: str, filename: str, evandjelje: dict) -> str:
+    """
+    Kreira GitHub Release i uploaduje MP3. Vraća URL do fajla.
+    """
+    today = datetime.date.today()
+    tag = f"ep-{today.strftime('%Y-%m-%d')}"
+    release_name = f"Evanđelje {today.strftime('%d. %m. %Y.')} — {evandjelje['referenca']}"
+    release_body = f"{evandjelje['naslov']}\n\nIzvor: {get_today_url()}"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # 1. Kreiraj release
+    print(f"Kreiram GitHub Release: {tag}")
+    r = requests.post(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases",
+        headers=headers,
+        json={
+            "tag_name": tag,
+            "name": release_name,
+            "body": release_body,
+            "draft": False,
+            "prerelease": False,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    release = r.json()
+    upload_url = release["upload_url"].replace("{?name,label}", "")
+    asset_id = release["id"]
+
+    # 2. Upload MP3
+    print(f"Uploading MP3 na GitHub Release...")
+    file_size = os.path.getsize(mp3_path)
+    with open(mp3_path, "rb") as f:
+        upload_resp = requests.post(
+            f"{upload_url}?name={filename}",
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Content-Type": "audio/mpeg",
+                "Content-Length": str(file_size),
+            },
+            data=f,
+            timeout=120,
+        )
+    upload_resp.raise_for_status()
+    mp3_url = upload_resp.json()["browser_download_url"]
+    print(f"MP3 dostupan na: {mp3_url}")
+    return mp3_url
+
+
+# ── RSS Feed ───────────────────────────────────────────────────────────────────
+
+def azuriraj_rss(mp3_url: str, mp3_path: str, evandjelje: dict) -> None:
+    """
+    Dohvaća postojeći feed.xml iz repozitorija, dodaje novi item i commituje ga.
+    """
+    today = datetime.date.today()
+    file_size = os.path.getsize(mp3_path)
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Dohvati postojeći feed.xml (ako postoji)
+    existing_items = ""
+    existing_sha = None
+    r = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/feed.xml",
+        headers=headers,
+        timeout=15,
+    )
+    if r.status_code == 200:
+        import base64
+        existing_content = base64.b64decode(r.json()["content"]).decode("utf-8")
+        existing_sha = r.json()["sha"]
+        # Izvuci postojeće <item> elemente
+        match = re.search(r"(<item>.*?</item>)", existing_content, re.DOTALL)
+        if match:
+            # Uzmi sve item tagove
+            items = re.findall(r"<item>.*?</item>", existing_content, re.DOTALL)
+            # Zadrži zadnjih 30 epizoda
+            existing_items = "\n    ".join(items[:30])
+
+    # Novi item
+    pub_date = datetime.datetime.now().strftime("%a, %d %b %Y %H:%M:%S +0000")
+    novi_item = f"""<item>
+      <title>Evanđelje {today.strftime("%-d. %-m. %Y.")} — {evandjelje["referenca"]}</title>
+      <description>{evandjelje["naslov"]} {evandjelje["tekst"][:200]}...</description>
+      <enclosure url="{mp3_url}" length="{file_size}" type="audio/mpeg"/>
+      <guid>{mp3_url}</guid>
+      <pubDate>{pub_date}</pubDate>
+    </item>"""
+
+    # Složi cijeli feed
+    feed = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Evanđelje dana</title>
+    <link>https://hilp.hr/liturgija-dana/</link>
+    <description>Dnevno evanđelje — čitanje ponovljeno 3 puta unutar 10 minuta</description>
+    <language>hr</language>
+    <itunes:author>Automatski podcast</itunes:author>
+    <itunes:category text="Religion &amp; Spirituality"/>
+    <itunes:explicit>false</itunes:explicit>
+    {novi_item}
+    {existing_items}
+  </channel>
+</rss>"""
+
+    # Commituj feed.xml u repozitorij
+    import base64
+    encoded = base64.b64encode(feed.encode("utf-8")).decode("utf-8")
+    payload = {
+        "message": f"Dodaj evanđelje {today.strftime('%Y-%m-%d')}",
+        "content": encoded,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    r = requests.put(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/feed.xml",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    print(f"RSS feed ažuriran: {GITHUB_PAGES_BASE}/feed.xml")
+
+
 # ── Email ──────────────────────────────────────────────────────────────────────
 
-def send_email(mp3_path: str, evandjelje: dict, recipient: str) -> None:
+def send_email(mp3_path: str, evandjelje: dict, recipient: str, mp3_url: str) -> None:
     today = datetime.date.today()
     subject = f"Evanđelje dana — {today.strftime('%d. %m. %Y.')} — {evandjelje['referenca']}"
 
@@ -191,6 +316,7 @@ def send_email(mp3_path: str, evandjelje: dict, recipient: str) -> None:
         f"📖 {evandjelje['referenca']}\n"
         f"✝ {evandjelje['naslov']}\n\n"
         f"Čitanje je ponovljeno 3 puta unutar 10 minuta.\n\n"
+        f"🎙️ Podcast RSS feed:\n{GITHUB_PAGES_BASE}/feed.xml\n\n"
         f"Lp,\nVaš automatski podsjetnik"
     )
 
@@ -218,23 +344,32 @@ def send_email(mp3_path: str, evandjelje: dict, recipient: str) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    today = datetime.date.today()
+    filename = f"evandjelje-{today.strftime('%d-%m-%Y')}.mp3"
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # 1. Scrape
         url = get_today_url()
         evandjelje = scrape_evandjelje(url)
 
-        # 2. Generiraj TTS samo jednom (audio se kopira 3x — štedi ElevenLabs tokene)
+        # 2. Generiraj TTS samo jednom
         text = build_tts_text(evandjelje)
         reading_path = os.path.join(tmpdir, "reading.mp3")
         generate_tts(text, reading_path)
 
-        # 3. Spoji u 10-minutni audio (5s intro + čitanje×3 + tišine)
+        # 3. Spoji u 10-minutni audio
         final_audio = build_final_audio(reading_path, TARGET_DURATION_MS)
-        final_path = os.path.join(tmpdir, "evandjelje_final.mp3")
+        final_path = os.path.join(tmpdir, filename)
         final_audio.export(final_path, format="mp3", bitrate="128k")
 
-        # 4. Pošalji mail
-        send_email(final_path, evandjelje, RECIPIENT_EMAIL)
+        # 4. Upload na GitHub Release
+        mp3_url = upload_to_github_release(final_path, filename, evandjelje)
+
+        # 5. Ažuriraj RSS feed
+        azuriraj_rss(mp3_url, final_path, evandjelje)
+
+        # 6. Pošalji mail
+        send_email(final_path, evandjelje, RECIPIENT_EMAIL, mp3_url)
 
     print("Gotovo! ✓")
 
