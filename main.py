@@ -112,11 +112,8 @@ def scrape_evandjelje(url: str) -> dict:
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
 
-def build_tts_text(evandjelje: dict, reading_number: int) -> str:
-    if reading_number == 1:
-        return evandjelje["tekst"]
-    else:
-        return f"Ponavljanje. {evandjelje['tekst']}"
+def build_tts_text(evandjelje: dict) -> str:
+    return evandjelje["tekst"]
 
 
 def generate_tts(text: str, output_path: str) -> None:
@@ -147,27 +144,29 @@ def generate_tts(text: str, output_path: str) -> None:
 
 # ── Audio montaža ──────────────────────────────────────────────────────────────
 
-def build_final_audio(reading_paths: list, target_ms: int) -> AudioSegment:
+def build_final_audio(reading_path: str, target_ms: int) -> AudioSegment:
     """
-    Raspored: [tišina] čitanje1 [tišina] čitanje2 [tišina] čitanje3 [tišina]
-    4 jednaka bloka tišine.
+    Raspored: 5s tišina | čitanje | tišina | čitanje | tišina | čitanje | tišina
+    ElevenLabs se poziva samo jednom, audio se kopira 3x.
     """
-    segments = [AudioSegment.from_mp3(p) for p in reading_paths]
-    total_reading_ms = sum(len(s) for s in segments)
-    remaining_ms = target_ms - total_reading_ms
+    segment = AudioSegment.from_mp3(reading_path)
+    reading_ms = len(segment)
+    intro_ms = 5000  # 5 sekundi na početku
+    remaining_ms = target_ms - intro_ms - (reading_ms * 3)
 
     if remaining_ms < 0:
         print("UPOZORENJE: Čitanja su dulja od 10 min!")
         silence_ms = 1000
     else:
-        silence_ms = remaining_ms // 4  # 4 bloka tišine
+        # 3 bloka tišine: između čitanja (×2) + na kraju (×1)
+        silence_ms = remaining_ms // 3
 
-    print(f"Trajanje čitanja: {total_reading_ms/1000:.1f}s")
+    print(f"Trajanje jednog čitanja: {reading_ms/1000:.1f}s")
     print(f"Tišina po bloku: {silence_ms/1000:.1f}s")
 
-    final = AudioSegment.silent(duration=silence_ms)
-    for i, seg in enumerate(segments):
-        final += seg
+    final = AudioSegment.silent(duration=intro_ms)
+    for i in range(3):
+        final += segment
         final += AudioSegment.silent(duration=silence_ms)
 
     # Fino podešavanje na točno 10 min
@@ -224,18 +223,13 @@ def main():
         url = get_today_url()
         evandjelje = scrape_evandjelje(url)
 
-        # 2. Generiraj 3 TTS audio fajla
-        reading_paths = []
-        for i in range(1, 4):
-            text = build_tts_text(evandjelje, i)
-            path = os.path.join(tmpdir, f"reading_{i}.mp3")
-            generate_tts(text, path)
-            reading_paths.append(path)
-            if i < 3:
-                time.sleep(1)
+        # 2. Generiraj TTS samo jednom (audio se kopira 3x — štedi ElevenLabs tokene)
+        text = build_tts_text(evandjelje)
+        reading_path = os.path.join(tmpdir, "reading.mp3")
+        generate_tts(text, reading_path)
 
-        # 3. Spoji u 10-minutni audio
-        final_audio = build_final_audio(reading_paths, TARGET_DURATION_MS)
+        # 3. Spoji u 10-minutni audio (5s intro + čitanje×3 + tišine)
+        final_audio = build_final_audio(reading_path, TARGET_DURATION_MS)
         final_path = os.path.join(tmpdir, "evandjelje_final.mp3")
         final_audio.export(final_path, format="mp3", bitrate="128k")
 
