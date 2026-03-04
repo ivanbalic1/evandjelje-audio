@@ -31,8 +31,8 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ivan-os@live.com")
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO_AUDIO = "ivanbalic1/evandjelje-audio"
-GITHUB_REPO_PAGES = "ivanbalic1/ivanbalic1.github.io"
-GITHUB_PAGES_BASE = "https://ivanbalic1.github.io"
+GITHUB_REPO_PAGES = "ivanbalic1/evandjelje-audio"
+GITHUB_PAGES_BASE = "https://ivanbalic1.github.io/evandjelje-audio"
 
 TARGET_DURATION_MS = 10 * 60 * 1000  # 10 minuta
 
